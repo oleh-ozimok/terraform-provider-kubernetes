@@ -7,12 +7,14 @@ import (
 
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
+	api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	pkgApi "k8s.io/apimachinery/pkg/types"
-	kubernetes "k8s.io/client-go/kubernetes"
-	api "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/kubernetes"
 )
+
+const defaultServiceAccountName = "default"
 
 func resourceKubernetesServiceAccount() *schema.Resource {
 	return &schema.Resource{
@@ -21,10 +23,9 @@ func resourceKubernetesServiceAccount() *schema.Resource {
 		Exists: resourceKubernetesServiceAccountExists,
 		Update: resourceKubernetesServiceAccountUpdate,
 		Delete: resourceKubernetesServiceAccountDelete,
-
-		// This resource is not importable because the API doesn't offer
-		// any way to differentiate between default & user-defined secret
-		// after the account was created.
+		Importer: &schema.ResourceImporter{
+			State: resourceKubernetesServiceAccountImportState,
+		},
 
 		Schema: map[string]*schema.Schema{
 			"metadata": namespacedMetadataSchema("service account", true),
@@ -144,9 +145,14 @@ func resourceKubernetesServiceAccountRead(d *schema.ResourceData, meta interface
 	if err != nil {
 		return err
 	}
-	d.Set("image_pull_secret", flattenLocalObjectReferenceArray(svcAcc.ImagePullSecrets))
 
 	defaultSecretName := d.Get("default_secret_name").(string)
+	if defaultSecretName == "" {
+		defaultSecretName = svcAcc.Secrets[0].Name
+	}
+
+	d.Set("image_pull_secret", flattenLocalObjectReferenceArray(svcAcc.ImagePullSecrets))
+
 	log.Printf("[DEBUG] Default secret name is %q", defaultSecretName)
 	secrets := flattenServiceAccountSecrets(svcAcc.Secrets, defaultSecretName)
 	log.Printf("[DEBUG] Flattened secrets: %#v", secrets)
@@ -166,7 +172,7 @@ func resourceKubernetesServiceAccountUpdate(d *schema.ResourceData, meta interfa
 	ops := patchMetadata("metadata.0.", "/metadata/", d)
 	if d.HasChange("image_pull_secret") {
 		v := d.Get("image_pull_secret").(*schema.Set).List()
-		ops = append(ops, &ReplaceOperation{
+		ops = append(ops, &AddOperation{
 			Path:  "/imagePullSecrets",
 			Value: expandLocalObjectReferenceArray(v),
 		})
@@ -203,6 +209,10 @@ func resourceKubernetesServiceAccountDelete(d *schema.ResourceData, meta interfa
 		return err
 	}
 
+	if name == defaultServiceAccountName {
+		return fmt.Errorf("Basically deleting a %s service account is a bad idea. Use 'terraform state rm' for manual delete", defaultServiceAccountName)
+	}
+
 	log.Printf("[INFO] Deleting service account: %#v", name)
 	err = conn.CoreV1().ServiceAccounts(namespace).Delete(name, &metav1.DeleteOptions{})
 	if err != nil {
@@ -232,4 +242,10 @@ func resourceKubernetesServiceAccountExists(d *schema.ResourceData, meta interfa
 		log.Printf("[DEBUG] Received error: %#v", err)
 	}
 	return true, err
+}
+
+func resourceKubernetesServiceAccountImportState(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
+	results := []*schema.ResourceData{d}
+
+	return results, resourceKubernetesServiceAccountRead(d, meta)
 }

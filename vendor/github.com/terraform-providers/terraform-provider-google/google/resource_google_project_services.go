@@ -30,6 +30,11 @@ func resourceGoogleProjectServices() *schema.Resource {
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
+			"disable_on_destroy": &schema.Schema{
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  true,
+			},
 		},
 	}
 }
@@ -105,6 +110,13 @@ func resourceGoogleProjectServicesUpdate(d *schema.ResourceData, meta interface{
 
 func resourceGoogleProjectServicesDelete(d *schema.ResourceData, meta interface{}) error {
 	log.Printf("[DEBUG]: Deleting google_project_services")
+
+	if disable := d.Get("disable_on_destroy"); !(disable.(bool)) {
+		log.Printf("Not disabling service '%s', because disable_on_destroy is false.", d.Id())
+		d.SetId("")
+		return nil
+	}
+
 	config := meta.(*Config)
 	services := resourceServices(d)
 	for _, s := range services {
@@ -186,17 +198,17 @@ func getApiServices(pid string, config *Config, ignore map[string]struct{}) ([]s
 
 func enableService(s, pid string, config *Config) error {
 	esr := newEnableServiceRequest(pid)
-	err := retry(func() error {
+	err := retryTime(func() error {
 		sop, err := config.clientServiceMan.Services.Enable(s, esr).Do()
 		if err != nil {
 			return err
 		}
-		waitErr := serviceManagementOperationWait(config, sop, "api to enable")
+		_, waitErr := serviceManagementOperationWait(config, sop, "api to enable")
 		if waitErr != nil {
 			return waitErr
 		}
 		return nil
-	})
+	}, 10)
 	if err != nil {
 		return fmt.Errorf("Error enabling service %q for project %q: %v", s, pid, err)
 	}
@@ -205,18 +217,18 @@ func enableService(s, pid string, config *Config) error {
 
 func disableService(s, pid string, config *Config) error {
 	dsr := newDisableServiceRequest(pid)
-	err := retry(func() error {
+	err := retryTime(func() error {
 		sop, err := config.clientServiceMan.Services.Disable(s, dsr).Do()
 		if err != nil {
 			return err
 		}
 		// Wait for the operation to complete
-		waitErr := serviceManagementOperationWait(config, sop, "api to disable")
+		_, waitErr := serviceManagementOperationWait(config, sop, "api to disable")
 		if waitErr != nil {
 			return waitErr
 		}
 		return nil
-	})
+	}, 10)
 	if err != nil {
 		return fmt.Errorf("Error disabling service %q for project %q: %v", s, pid, err)
 	}

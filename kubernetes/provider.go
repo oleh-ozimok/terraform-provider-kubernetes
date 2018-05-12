@@ -9,7 +9,7 @@ import (
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/mitchellh/go-homedir"
-	kubernetes "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -122,6 +122,10 @@ func Provider() terraform.ResourceProvider {
 			"kubernetes_service":                   resourceKubernetesService(),
 			"kubernetes_service_account":           resourceKubernetesServiceAccount(),
 			"kubernetes_storage_class":             resourceKubernetesStorageClass(),
+			"kubernetes_cluster_role":              resourceKubernetesClusterRole(),
+			"kubernetes_cluster_role_binding":      resourceKubernetesClusterRoleBinding(),
+			"kubernetes_role":                      resourceKubernetesRole(),
+			"kubernetes_role_binding":              resourceKubernetesRoleBinding(),
 		},
 		ConfigureFunc: providerConfigure,
 	}
