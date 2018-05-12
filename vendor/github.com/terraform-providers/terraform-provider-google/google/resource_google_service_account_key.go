@@ -2,6 +2,7 @@ package google
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/terraform/helper/encryption"
 	"github.com/hashicorp/terraform/helper/schema"
@@ -88,6 +89,9 @@ func resourceGoogleServiceAccountKeyCreate(d *schema.ResourceData, meta interfac
 	config := meta.(*Config)
 
 	serviceAccount := d.Get("service_account_id").(string)
+	if !strings.HasPrefix(serviceAccount, "projects/") {
+		serviceAccount = "projects/-/serviceAccounts/" + serviceAccount
+	}
 
 	r := &iam.CreateServiceAccountKeyRequest{
 		KeyAlgorithm:   d.Get("key_algorithm").(string),

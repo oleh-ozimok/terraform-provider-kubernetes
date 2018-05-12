@@ -1,16 +1,19 @@
 package google
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
 
-	"github.com/hashicorp/terraform/helper/hashcode"
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/terraform/helper/schema"
-	"google.golang.org/api/compute/v1"
+	computeBeta "google.golang.org/api/compute/v0.beta"
+	compute "google.golang.org/api/compute/v1"
 )
+
+var BackendServiceBaseApiVersion = v1
+var BackendServiceVersionedFeatures = []Feature{Feature{Version: v0beta, Item: "security_policy"}}
 
 func resourceComputeBackendService() *schema.Resource {
 	return &schema.Resource{
@@ -34,7 +37,7 @@ func resourceComputeBackendService() *schema.Resource {
 			"health_checks": &schema.Schema{
 				Type:     schema.TypeSet,
 				Elem:     &schema.Schema{Type: schema.TypeString},
-				Set:      schema.HashString,
+				Set:      selfLinkRelativePathHash,
 				Required: true,
 				MinItems: 1,
 				MaxItems: 1,
@@ -98,10 +101,62 @@ func resourceComputeBackendService() *schema.Resource {
 							Type:     schema.TypeFloat,
 							Optional: true,
 						},
+						"max_connections": &schema.Schema{
+							Type:     schema.TypeInt,
+							Optional: true,
+						},
+						"max_connections_per_instance": &schema.Schema{
+							Type:     schema.TypeInt,
+							Optional: true,
+						},
 						"max_utilization": &schema.Schema{
 							Type:     schema.TypeFloat,
 							Optional: true,
 							Default:  0.8,
+						},
+					},
+				},
+			},
+
+			"cdn_policy": &schema.Schema{
+				Type:     schema.TypeList,
+				Optional: true,
+				Computed: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"cache_key_policy": &schema.Schema{
+							Type:     schema.TypeList,
+							Optional: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"include_host": &schema.Schema{
+										Type:     schema.TypeBool,
+										Optional: true,
+									},
+									"include_protocol": &schema.Schema{
+										Type:     schema.TypeBool,
+										Optional: true,
+									},
+									"include_query_string": &schema.Schema{
+										Type:     schema.TypeBool,
+										Optional: true,
+									},
+									"query_string_blacklist": &schema.Schema{
+										Type:          schema.TypeSet,
+										Optional:      true,
+										Elem:          &schema.Schema{Type: schema.TypeString},
+										ConflictsWith: []string{"cdn_policy.0.cache_key_policy.query_string_whitelist"},
+									},
+									"query_string_whitelist": &schema.Schema{
+										Type:          schema.TypeSet,
+										Optional:      true,
+										Elem:          &schema.Schema{Type: schema.TypeString},
+										ConflictsWith: []string{"cdn_policy.0.cache_key_policy.query_string_blacklist"},
+									},
+								},
+							},
 						},
 					},
 				},
@@ -132,6 +187,7 @@ func resourceComputeBackendService() *schema.Resource {
 			"project": &schema.Schema{
 				Type:     schema.TypeString,
 				Optional: true,
+				Computed: true,
 				ForceNew: true,
 			},
 
@@ -146,6 +202,12 @@ func resourceComputeBackendService() *schema.Resource {
 				Optional: true,
 				ForceNew: true,
 				Removed:  "region has been removed as it was never used. For internal load balancing, use google_compute_region_backend_service",
+			},
+
+			"security_policy": &schema.Schema{
+				Type:             schema.TypeString,
+				Optional:         true,
+				DiffSuppressFunc: compareSelfLinkOrResourceName,
 			},
 
 			"self_link": &schema.Schema{
@@ -207,10 +269,26 @@ func resourceComputeBackendServiceCreate(d *schema.ResourceData, meta interface{
 		return waitErr
 	}
 
+	if v, ok := d.GetOk("security_policy"); ok {
+		pol, err := ParseSecurityPolicyFieldValue(v.(string), d, config)
+		op, err := config.clientComputeBeta.BackendServices.SetSecurityPolicy(
+			project, service.Name, &computeBeta.SecurityPolicyReference{
+				SecurityPolicy: pol.RelativeLink(),
+			}).Do()
+		if err != nil {
+			return errwrap.Wrapf("Error setting Backend Service security policy: {{err}}", err)
+		}
+		waitErr := computeSharedOperationWait(config.clientCompute, op, project, "Adding Backend Service Security Policy")
+		if waitErr != nil {
+			return waitErr
+		}
+	}
+
 	return resourceComputeBackendServiceRead(d, meta)
 }
 
 func resourceComputeBackendServiceRead(d *schema.ResourceData, meta interface{}) error {
+	computeApiVersion := getComputeApiVersion(d, BackendServiceBaseApiVersion, BackendServiceVersionedFeatures)
 	config := meta.(*Config)
 
 	project, err := getProject(d, config)
@@ -218,10 +296,25 @@ func resourceComputeBackendServiceRead(d *schema.ResourceData, meta interface{})
 		return err
 	}
 
-	service, err := config.clientCompute.BackendServices.Get(
-		project, d.Id()).Do()
-	if err != nil {
-		return handleNotFoundError(err, d, fmt.Sprintf("Backend Service %q", d.Get("name").(string)))
+	service := &computeBeta.BackendService{}
+	switch computeApiVersion {
+	case v1:
+		v1Service, err := config.clientCompute.BackendServices.Get(
+			project, d.Id()).Do()
+		if err != nil {
+			return handleNotFoundError(err, d, fmt.Sprintf("Backend Service %q", d.Get("name").(string)))
+		}
+		err = Convert(v1Service, service)
+		if err != nil {
+			return err
+		}
+	case v0beta:
+		var err error
+		service, err = config.clientComputeBeta.BackendServices.Get(
+			project, d.Id()).Do()
+		if err != nil {
+			return handleNotFoundError(err, d, fmt.Sprintf("Backend Service %q", d.Get("name").(string)))
+		}
 	}
 
 	d.Set("name", service.Name)
@@ -236,8 +329,12 @@ func resourceComputeBackendServiceRead(d *schema.ResourceData, meta interface{})
 	d.Set("backend", flattenBackends(service.Backends))
 	d.Set("connection_draining_timeout_sec", service.ConnectionDraining.DrainingTimeoutSec)
 	d.Set("iap", flattenIap(service.Iap))
-
+	d.Set("project", project)
 	d.Set("health_checks", service.HealthChecks)
+	if err := d.Set("cdn_policy", flattenCdnPolicy(service.CdnPolicy)); err != nil {
+		return err
+	}
+	d.Set("security_policy", service.SecurityPolicy)
 
 	return nil
 }
@@ -263,11 +360,27 @@ func resourceComputeBackendServiceUpdate(d *schema.ResourceData, meta interface{
 		return fmt.Errorf("Error updating backend service: %s", err)
 	}
 
-	d.SetId(service.Name)
-
 	err = computeOperationWait(config.clientCompute, op, project, "Updating Backend Service")
 	if err != nil {
 		return err
+	}
+
+	if d.HasChange("security_policy") {
+		pol, err := ParseSecurityPolicyFieldValue(d.Get("security_policy").(string), d, config)
+		if err != nil {
+			return err
+		}
+		op, err := config.clientComputeBeta.BackendServices.SetSecurityPolicy(
+			project, service.Name, &computeBeta.SecurityPolicyReference{
+				SecurityPolicy: pol.RelativeLink(),
+			}).Do()
+		if err != nil {
+			return err
+		}
+		waitErr := computeSharedOperationWait(config.clientCompute, op, project, "Adding Backend Service Security Policy")
+		if waitErr != nil {
+			return waitErr
+		}
 	}
 
 	return resourceComputeBackendServiceRead(d, meta)
@@ -298,28 +411,33 @@ func resourceComputeBackendServiceDelete(d *schema.ResourceData, meta interface{
 }
 
 func expandIap(configured []interface{}) *compute.BackendServiceIAP {
-	data := configured[0].(map[string]interface{})
-	iap := &compute.BackendServiceIAP{
-		Enabled:            true,
-		Oauth2ClientId:     data["oauth2_client_id"].(string),
-		Oauth2ClientSecret: data["oauth2_client_secret"].(string),
-		ForceSendFields:    []string{"Enabled", "Oauth2ClientId", "Oauth2ClientSecret"},
+	if len(configured) == 0 {
+		return nil
+	}
+	if data, ok := configured[0].(map[string]interface{}); ok {
+		return &compute.BackendServiceIAP{
+			Enabled:            true,
+			Oauth2ClientId:     data["oauth2_client_id"].(string),
+			Oauth2ClientSecret: data["oauth2_client_secret"].(string),
+			ForceSendFields:    []string{"Enabled", "Oauth2ClientId", "Oauth2ClientSecret"},
+		}
 	}
 
-	return iap
+	return nil
 }
 
-func flattenIap(iap *compute.BackendServiceIAP) []map[string]interface{} {
-	if iap == nil {
-		return make([]map[string]interface{}, 1, 1)
+func flattenIap(iap *computeBeta.BackendServiceIAP) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, 1)
+	if iap == nil || !iap.Enabled {
+		return result
 	}
 
-	iapMap := map[string]interface{}{
-		"enabled":              iap.Enabled,
+	result = append(result, map[string]interface{}{
 		"oauth2_client_id":     iap.Oauth2ClientId,
 		"oauth2_client_secret": iap.Oauth2ClientSecretSha256,
-	}
-	return []map[string]interface{}{iapMap}
+	})
+
+	return result
 }
 
 func expandBackends(configured []interface{}) ([]*compute.Backend, error) {
@@ -342,18 +460,38 @@ func expandBackends(configured []interface{}) ([]*compute.Backend, error) {
 		}
 		if v, ok := data["capacity_scaler"]; ok {
 			b.CapacityScaler = v.(float64)
+			b.ForceSendFields = append(b.ForceSendFields, "CapacityScaler")
 		}
 		if v, ok := data["description"]; ok {
 			b.Description = v.(string)
 		}
 		if v, ok := data["max_rate"]; ok {
 			b.MaxRate = int64(v.(int))
+			if b.MaxRate == 0 {
+				b.NullFields = append(b.NullFields, "MaxRate")
+			}
 		}
 		if v, ok := data["max_rate_per_instance"]; ok {
 			b.MaxRatePerInstance = v.(float64)
+			if b.MaxRatePerInstance == 0 {
+				b.NullFields = append(b.NullFields, "MaxRatePerInstance")
+			}
+		}
+		if v, ok := data["max_connections"]; ok {
+			b.MaxConnections = int64(v.(int))
+			if b.MaxConnections == 0 {
+				b.NullFields = append(b.NullFields, "MaxConnections")
+			}
+		}
+		if v, ok := data["max_connections_per_instance"]; ok {
+			b.MaxConnectionsPerInstance = int64(v.(int))
+			if b.MaxConnectionsPerInstance == 0 {
+				b.NullFields = append(b.NullFields, "MaxConnectionsPerInstance")
+			}
 		}
 		if v, ok := data["max_utilization"]; ok {
 			b.MaxUtilization = v.(float64)
+			b.ForceSendFields = append(b.ForceSendFields, "MaxUtilization")
 		}
 
 		backends = append(backends, &b)
@@ -362,7 +500,7 @@ func expandBackends(configured []interface{}) ([]*compute.Backend, error) {
 	return backends, nil
 }
 
-func flattenBackends(backends []*compute.Backend) []map[string]interface{} {
+func flattenBackends(backends []*computeBeta.Backend) []map[string]interface{} {
 	result := make([]map[string]interface{}, 0, len(backends))
 
 	for _, b := range backends {
@@ -374,6 +512,8 @@ func flattenBackends(backends []*compute.Backend) []map[string]interface{} {
 		data["group"] = b.Group
 		data["max_rate"] = b.MaxRate
 		data["max_rate_per_instance"] = b.MaxRatePerInstance
+		data["max_connections"] = b.MaxConnections
+		data["max_connections_per_instance"] = b.MaxConnectionsPerInstance
 		data["max_utilization"] = b.MaxUtilization
 		result = append(result, data)
 	}
@@ -392,7 +532,7 @@ func expandBackendService(d *schema.ResourceData) (*compute.BackendService, erro
 	// the IAP configuration block (and providing the client id
 	// and secret). We are force sending the three required API fields
 	// to enable/disable IAP at all times here, and relying on Golang's
-	// type defaults to enable or disable IAP in the existance or absense
+	// type defaults to enable or disable IAP in the existence or absence
 	// of the block, instead of checking if the block exists, zeroing out
 	// fields, etc.
 	service := &compute.BackendService{
@@ -400,6 +540,11 @@ func expandBackendService(d *schema.ResourceData) (*compute.BackendService, erro
 		HealthChecks: healthChecks,
 		Iap: &compute.BackendServiceIAP{
 			ForceSendFields: []string{"Enabled", "Oauth2ClientId", "Oauth2ClientSecret"},
+		},
+		CdnPolicy: &compute.BackendServiceCdnPolicy{
+			CacheKeyPolicy: &compute.CacheKeyPolicy{
+				ForceSendFields: []string{"IncludeProtocol", "IncludeHost", "IncludeQueryString", "QueryStringWhitelist", "QueryStringBlacklist"},
+			},
 		},
 	}
 
@@ -446,38 +591,55 @@ func expandBackendService(d *schema.ResourceData) (*compute.BackendService, erro
 
 	service.ConnectionDraining = connectionDraining
 
+	if v, ok := d.GetOk("cdn_policy"); ok {
+		c := expandCdnPolicy(v.([]interface{}))
+		if c != nil {
+			service.CdnPolicy = c
+		}
+	}
+
 	return service, nil
 }
 
-func resourceGoogleComputeBackendServiceBackendHash(v interface{}) int {
-	if v == nil {
-		return 0
+func expandCdnPolicy(configured []interface{}) *compute.BackendServiceCdnPolicy {
+	if len(configured) == 0 {
+		return nil
+	}
+	data := configured[0].(map[string]interface{})
+
+	ckp := data["cache_key_policy"].([]interface{})
+	if len(ckp) == 0 {
+		return nil
+	}
+	ckpData := ckp[0].(map[string]interface{})
+
+	return &compute.BackendServiceCdnPolicy{
+		CacheKeyPolicy: &compute.CacheKeyPolicy{
+			IncludeHost:          ckpData["include_host"].(bool),
+			IncludeProtocol:      ckpData["include_protocol"].(bool),
+			IncludeQueryString:   ckpData["include_query_string"].(bool),
+			QueryStringBlacklist: convertStringSet(ckpData["query_string_blacklist"].(*schema.Set)),
+			QueryStringWhitelist: convertStringSet(ckpData["query_string_whitelist"].(*schema.Set)),
+			ForceSendFields:      []string{"IncludeProtocol", "IncludeHost", "IncludeQueryString", "QueryStringWhitelist", "QueryStringBlacklist"},
+		},
+	}
+}
+
+func flattenCdnPolicy(pol *computeBeta.BackendServiceCdnPolicy) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	if pol == nil || pol.CacheKeyPolicy == nil {
+		return result
 	}
 
-	var buf bytes.Buffer
-	m := v.(map[string]interface{})
-
-	group, _ := getRelativePath(m["group"].(string))
-	buf.WriteString(fmt.Sprintf("%s-", group))
-
-	if v, ok := m["balancing_mode"]; ok {
-		buf.WriteString(fmt.Sprintf("%s-", v.(string)))
-	}
-	if v, ok := m["capacity_scaler"]; ok {
-		buf.WriteString(fmt.Sprintf("%f-", v.(float64)))
-	}
-	if v, ok := m["description"]; ok {
-		buf.WriteString(fmt.Sprintf("%s-", v.(string)))
-	}
-	if v, ok := m["max_rate"]; ok {
-		buf.WriteString(fmt.Sprintf("%d-", int64(v.(int))))
-	}
-	if v, ok := m["max_rate_per_instance"]; ok {
-		buf.WriteString(fmt.Sprintf("%f-", v.(float64)))
-	}
-	if v, ok := m["max_rate_per_instance"]; ok {
-		buf.WriteString(fmt.Sprintf("%f-", v.(float64)))
-	}
-
-	return hashcode.String(buf.String())
+	return append(result, map[string]interface{}{
+		"cache_key_policy": []map[string]interface{}{
+			{
+				"include_host":           pol.CacheKeyPolicy.IncludeHost,
+				"include_protocol":       pol.CacheKeyPolicy.IncludeProtocol,
+				"include_query_string":   pol.CacheKeyPolicy.IncludeQueryString,
+				"query_string_blacklist": schema.NewSet(schema.HashString, convertStringArrToInterface(pol.CacheKeyPolicy.QueryStringBlacklist)),
+				"query_string_whitelist": schema.NewSet(schema.HashString, convertStringArrToInterface(pol.CacheKeyPolicy.QueryStringWhitelist)),
+			},
+		},
+	})
 }

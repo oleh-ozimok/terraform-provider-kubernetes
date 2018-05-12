@@ -1,0 +1,45 @@
+package: github.com/terraform-providers/terraform-provider-kubernetes
+import:
+- package: github.com/hashicorp/go-version
+- package: github.com/hashicorp/terraform
+  version: ^0.11.7
+  subpackages:
+  - helper/resource
+  - helper/schema
+  - plugin
+  - terraform
+- package: github.com/mitchellh/go-homedir
+- package: k8s.io/api
+  subpackages:
+  - autoscaling/v1
+  - core/v1
+  - rbac/v1
+  - storage/v1
+- package: k8s.io/apimachinery
+  subpackages:
+  - pkg/api/errors
+  - pkg/api/resource
+  - pkg/api/validation
+  - pkg/apis/meta/v1
+  - pkg/fields
+  - pkg/types
+  - pkg/util/intstr
+  - pkg/util/validation
+  - pkg/version
+- package: k8s.io/client-go
+  version: ^7.0.0
+  subpackages:
+  - kubernetes
+  - plugin/pkg/client/auth
+  - rest
+  - tools/clientcmd
+  - tools/clientcmd/api
+testImport:
+- package: github.com/terraform-providers/terraform-provider-aws
+  version: ^1.18.0
+  subpackages:
+  - aws
+- package: github.com/terraform-providers/terraform-provider-google
+  version: ^1.12.0
+  subpackages:
+  - google
